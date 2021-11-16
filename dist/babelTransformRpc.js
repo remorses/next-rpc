@@ -71,6 +71,10 @@ function default_1({ types: t }, { apiDir, pagesDir, isServer, basePath }) {
                                         rpcMethodNames.push(id.name);
                                     }
                                 }
+                                else if (t.isIdentifier(varDeclaration.id) &&
+                                    t.isCallExpression(varDeclaration.init)) {
+                                    rpcMethodNames.push(varDeclaration.id.name);
+                                }
                                 else {
                                     errors.push(path.buildCodeFrameError('rpc exports must be static functions'));
                                 }
