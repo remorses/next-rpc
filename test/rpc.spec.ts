@@ -1,26 +1,17 @@
-const path = require('path');
-const puppeteer = require('puppeteer');
-const { promises: fs } = require('fs');
-const { buildNext, startNext, cleanup } = require('./utils');
-const { default: fetch } = require('node-fetch');
-
-const PUPPETEER_OPTIONS =
-  process.arch === 'arm64'
-    ? {
-        executablePath:
-          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      }
-    : undefined;
+import path from 'path';
+import puppeteer from 'puppeteer';
+import * as fs from 'fs/promises';
+import { buildNext, startNext, cleanup, RunningNextApp } from './utils';
+import fetch from 'node-fetch';
+import { Browser } from 'puppeteer';
 
 const FIXTURE_PATH = path.resolve(__dirname, './__fixtures__/basic-app');
 
-/**
- * @param {string} filepath
- * @param {string} test
- * @param {() => Promise<void>} assertions
- * @returns {Promise<void>}
- */
-async function withEnabledTest(filepath, test, assertions) {
+async function withEnabledTest(
+  filepath: string,
+  test: string,
+  assertions: () => Promise<void>
+): Promise<void> {
   const content = await fs.readFile(filepath, { encoding: 'utf-8' });
   const newContent = content.replace(`/* TEST "${test}"`, '');
   try {
@@ -31,22 +22,16 @@ async function withEnabledTest(filepath, test, assertions) {
   }
 }
 
-afterAll(() => cleanup(FIXTURE_PATH));
+beforeAll(() => cleanup(FIXTURE_PATH));
 
 describe('basic-app', () => {
-  /**
-   * @type {import('puppeteer').Browser}
-   */
-  let browser;
-  /**
-   * @type {import('./utils').RunningNextApp}
-   */
-  let app;
+  let browser: Browser;
+  let app: RunningNextApp;
 
   beforeAll(async () => {
     await Promise.all([
       buildNext(FIXTURE_PATH),
-      puppeteer.launch(PUPPETEER_OPTIONS).then((b) => (browser = b)),
+      puppeteer.launch().then((b) => (browser = b)),
     ]);
     app = await startNext(FIXTURE_PATH);
   }, 30000);
@@ -145,6 +130,52 @@ describe('basic-app', () => {
       expect.stringMatching('method "GET" is not allowed')
     );
   });
+
+  test('should wrap methods 1', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.goto(new URL('/wrapped1', app.url).toString());
+      const ssrData = await page.$eval('#ssr', (el) => el.textContent);
+      expect(ssrData).toBe('wrapped result "original called with foo,bar"');
+      await page.waitForSelector('#browser');
+      const browserData = await page.$eval('#browser', (el) => el.textContent);
+      expect(browserData).toBe(
+        'wrapped result "original called with baz,quux"'
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('should wrap methods 2', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.goto(new URL('/wrapped2', app.url).toString());
+      const ssrData = await page.$eval('#ssr', (el) => el.textContent);
+      expect(ssrData).toBe('wrapped result "original called with bar,foo"');
+      await page.waitForSelector('#browser');
+      const browserData = await page.$eval('#browser', (el) => el.textContent);
+      expect(browserData).toBe(
+        'wrapped result "original called with quux,baz"'
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('should wrap methods 3', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.goto(new URL('/wrapped3', app.url).toString());
+      const ssrData = await page.$eval('#ssr', (el) => el.textContent);
+      expect(ssrData).toBe('wrapped result "original called with quux,foo"');
+      await page.waitForSelector('#browser');
+      const browserData = await page.$eval('#browser', (el) => el.textContent);
+      expect(browserData).toBe('wrapped result "original called with bar,baz"');
+    } finally {
+      await page.close();
+    }
+  });
 });
 
 describe('build', () => {
@@ -170,7 +201,7 @@ describe('build', () => {
         const build = buildNext(FIXTURE_PATH);
         await expect(build).rejects.toHaveProperty(
           'message',
-          expect.stringMatching('rpc exports must be declared "async"')
+          expect.stringMatching('rpc exports must be async functions')
         );
       }
     );
@@ -184,7 +215,7 @@ describe('build', () => {
         const build = buildNext(FIXTURE_PATH);
         await expect(build).rejects.toHaveProperty(
           'message',
-          expect.stringMatching('rpc exports must be declared "async"')
+          expect.stringMatching('rpc exports must be async functions')
         );
       }
     );
@@ -198,7 +229,7 @@ describe('build', () => {
         const build = buildNext(FIXTURE_PATH);
         await expect(build).rejects.toHaveProperty(
           'message',
-          expect.stringMatching('rpc exports must be declared "async"')
+          expect.stringMatching('rpc exports must be async functions')
         );
       }
     );

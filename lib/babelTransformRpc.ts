@@ -1,5 +1,6 @@
-import { annotateAsPure } from './astUtils';
+import { annotateAsPure, literalToAst } from './astUtils';
 import * as babel from '@babel/core';
+import { WrapMethodMeta } from './server';
 
 type Babel = typeof babel;
 type BabelTypes = typeof babel.types;
@@ -25,13 +26,70 @@ function buildRpcApiHandler(
 }
 
 function isAllowedTsExportDeclaration(
-  t: BabelTypes,
-  declaration: any
+  declaration: babel.NodePath<babel.types.Declaration | null | undefined>
 ): boolean {
   return (
-    t.isTSTypeAliasDeclaration(declaration) ||
-    t.isTSInterfaceDeclaration(declaration)
+    declaration.isTSTypeAliasDeclaration() ||
+    declaration.isTSInterfaceDeclaration()
   );
+}
+
+function getConfigObjectExpression(
+  variable: babel.NodePath<babel.types.VariableDeclarator>
+): babel.NodePath<babel.types.ObjectExpression> | null {
+  const identifier = variable.get('id');
+  const init = variable.get('init');
+  if (
+    identifier.isIdentifier() &&
+    identifier.node.name === 'config' &&
+    init.isObjectExpression()
+  ) {
+    return init;
+  } else {
+    return null;
+  }
+}
+
+function getConfigObject(
+  program: babel.NodePath<babel.types.Program>
+): babel.NodePath<babel.types.ObjectExpression> | null {
+  for (const statement of program.get('body')) {
+    if (statement.isExportNamedDeclaration()) {
+      const declaration = statement.get('declaration');
+      if (
+        declaration.isVariableDeclaration() &&
+        declaration.node.kind === 'const'
+      ) {
+        for (const variable of declaration.get('declarations')) {
+          const configObject = getConfigObjectExpression(variable);
+          if (configObject) {
+            return configObject;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function isRpc(
+  configObject: babel.NodePath<babel.types.ObjectExpression>
+): boolean {
+  for (const property of configObject.get('properties')) {
+    if (!property.isObjectProperty()) {
+      continue;
+    }
+    const key = property.get('key');
+    const value = property.get('value');
+    if (
+      property.isObjectProperty() &&
+      key.isIdentifier({ name: 'rpc' }) &&
+      value.isBooleanLiteral({ value: true })
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface PluginOptions {
@@ -48,7 +106,7 @@ export default function (
 ): babel.PluginObj {
   return {
     visitor: {
-      Program(path) {
+      Program(program) {
         const { filename } = this.file.opts;
 
         if (!filename) {
@@ -61,6 +119,12 @@ export default function (
           return;
         }
 
+        const configObject = getConfigObject(program);
+
+        if (!configObject || !isRpc(configObject)) {
+          return;
+        }
+
         const rpcRelativePath = filename
           .slice(pagesDir.length)
           .replace(/\.[j|t]sx?$/, '')
@@ -69,62 +133,88 @@ export default function (
         const rpcPath =
           basePath === '/' ? rpcRelativePath : `${basePath}/${rpcRelativePath}`;
 
-        const errors: Error[] = [];
         const rpcMethodNames: string[] = [];
-        let isRpc = false;
-        let defaultExportPath:
-          | babel.NodePath<babel.types.ExportDefaultDeclaration>
-          | undefined;
 
-        path.traverse({
-          ExportNamedDeclaration(path) {
-            const { declaration } = path.node;
-            if (isAllowedTsExportDeclaration(t, declaration)) {
-              return;
-            } else if (t.isFunctionDeclaration(declaration)) {
-              if (!declaration.async) {
-                errors.push(
-                  path.buildCodeFrameError(
-                    'rpc exports must be declared "async"'
-                  )
+        const createRpcMethodIdentifier =
+          program.scope.generateUidIdentifier('createRpcMethod');
+
+        const createRpcMethod = (
+          rpcMethod:
+            | babel.types.ArrowFunctionExpression
+            | babel.types.FunctionExpression,
+          meta: WrapMethodMeta
+        ) => {
+          return t.callExpression(createRpcMethodIdentifier, [
+            rpcMethod,
+            literalToAst(t, meta),
+            t.memberExpression(
+              t.identifier('config'),
+              t.identifier('wrapMethod')
+            ),
+          ]);
+        };
+
+        for (const statement of program.get('body')) {
+          if (statement.isExportNamedDeclaration()) {
+            const declaration = statement.get('declaration');
+            if (isAllowedTsExportDeclaration(declaration)) {
+              // ignore
+            } else if (declaration.isFunctionDeclaration()) {
+              if (!declaration.node.async) {
+                throw declaration.buildCodeFrameError(
+                  'rpc exports must be async functions'
                 );
               }
-              if (declaration.id) {
-                rpcMethodNames.push(declaration.id.name);
+              const identifier = declaration.get('id');
+              const methodName = identifier.node?.name;
+              if (methodName) {
+                rpcMethodNames.push(methodName);
+                if (isServer) {
+                  // replace with wrapped
+                  statement.replaceWith(
+                    t.exportNamedDeclaration(
+                      t.variableDeclaration('const', [
+                        t.variableDeclarator(
+                          t.identifier(methodName),
+                          createRpcMethod(t.toExpression(declaration.node), {
+                            name: methodName,
+                            pathname: rpcPath,
+                          })
+                        ),
+                      ])
+                    )
+                  );
+                }
               }
             } else if (
-              t.isVariableDeclaration(declaration) &&
-              declaration.kind === 'const'
+              declaration.isVariableDeclaration() &&
+              declaration.node.kind === 'const'
             ) {
-              for (const varDeclaration of declaration.declarations) {
-                if (
-                  t.isIdentifier(varDeclaration.id) &&
-                  varDeclaration.id.name === 'config' &&
-                  t.isObjectExpression(varDeclaration.init) &&
-                  varDeclaration.init.properties.some((property) => {
-                    return (
-                      t.isObjectProperty(property) &&
-                      t.isIdentifier(property.key) &&
-                      property.key.name === 'rpc' &&
-                      t.isBooleanLiteral(property.value, { value: true })
-                    );
-                  })
-                ) {
-                  isRpc = true;
+              for (const variable of declaration.get('declarations')) {
+                const init = variable.get('init');
+                if (getConfigObjectExpression(variable)) {
+                  // ignore, this is the only allowed non-function export
                 } else if (
-                  t.isFunctionExpression(varDeclaration.init) ||
-                  t.isArrowFunctionExpression(varDeclaration.init)
+                  init.isFunctionExpression() ||
+                  init.isArrowFunctionExpression()
                 ) {
-                  if (!varDeclaration.init.async) {
-                    errors.push(
-                      path.buildCodeFrameError(
-                        'rpc exports must be declared "async"'
-                      )
+                  if (!init.node.async) {
+                    throw init.buildCodeFrameError(
+                      'rpc exports must be async functions'
                     );
                   }
-                  const { id } = varDeclaration;
+                  const { id } = variable.node;
                   if (t.isIdentifier(id)) {
-                    rpcMethodNames.push(id.name);
+                    const methodName = id.name;
+                    rpcMethodNames.push(methodName);
+                    if (isServer) {
+                      init.replaceWith(
+                        createRpcMethod(init.node, {
+                          name: methodName,
+                          pathname: rpcPath,
+                        })
+                      );
+                    }
                   }
                 } else if (
                   t.isIdentifier(varDeclaration.id) &&
@@ -132,41 +222,28 @@ export default function (
                 ) {
                   rpcMethodNames.push(varDeclaration.id.name);
                 } else {
-                  errors.push(
-                    path.buildCodeFrameError(
-                      'rpc exports must be static functions'
-                    )
+                  throw variable.buildCodeFrameError(
+                    'rpc exports must be static functions'
                   );
                 }
               }
             } else {
-              errors.push(
-                path.buildCodeFrameError('rpc exports must be static functions')
-              );
+              for (const specifier of statement.get('specifiers')) {
+                throw specifier.buildCodeFrameError(
+                  'rpc exports must be static functions'
+                );
+              }
             }
-          },
-          ExportDefaultDeclaration(path) {
-            defaultExportPath = path;
-          },
-        });
-
-        if (!isRpc) {
-          return;
-        }
-
-        if (errors.length > 0) {
-          throw errors[0];
-        }
-
-        if (defaultExportPath) {
-          throw path.buildCodeFrameError(
-            'default exports are not allowed in rpc routes'
-          );
+          } else if (statement.isExportDefaultDeclaration()) {
+            throw statement.buildCodeFrameError(
+              'default exports are not allowed in rpc routes'
+            );
+          }
         }
 
         if (isServer) {
           const createRpcHandlerIdentifier =
-            path.scope.generateUidIdentifier('createRpcHandler');
+            program.scope.generateUidIdentifier('createRpcHandler');
 
           let apiHandlerExpression = buildRpcApiHandler(
             t,
@@ -174,9 +251,13 @@ export default function (
             rpcMethodNames
           );
 
-          path.node.body = [
+          program.unshiftContainer('body', [
             t.importDeclaration(
               [
+                t.importSpecifier(
+                  createRpcMethodIdentifier,
+                  t.identifier('createRpcMethod')
+                ),
                 t.importSpecifier(
                   createRpcHandlerIdentifier,
                   t.identifier('createRpcHandler')
@@ -184,14 +265,21 @@ export default function (
               ],
               t.stringLiteral(IMPORT_PATH_SERVER)
             ),
-            ...path.node.body,
+          ]);
+
+          program.pushContainer('body', [
             t.exportDefaultDeclaration(apiHandlerExpression),
-          ];
+          ]);
         } else {
           const createRpcFetcherIdentifier =
-            path.scope.generateUidIdentifier('createRpcFetcher');
+            program.scope.generateUidIdentifier('createRpcFetcher');
 
-          path.node.body = [
+          // Clear the whole body
+          for (const statement of program.get('body')) {
+            statement.remove();
+          }
+
+          program.pushContainer('body', [
             t.importDeclaration(
               [
                 t.importSpecifier(
@@ -217,7 +305,7 @@ export default function (
                 ])
               )
             ),
-          ];
+          ]);
         }
       },
     },
