@@ -87,11 +87,11 @@ export function findPagesDir(dir: string): string {
   // Check one level up the tree to see if the pages directory might be there
   if (fs.existsSync(path.join(dir, '..', 'pages'))) {
     throw new Error(
-      '> No `pages` directory found. Did you mean to run `next` in the parent (`../`) directory?'
+      'No `pages` directory found. Did you mean to run `next` in the parent (`../`) directory?'
     );
   }
 
   throw new Error(
-    "> Couldn't find a `pages` directory. Please create one under the project root"
+    "Couldn't find a `pages` directory. Please create one under the project root"
   );
 }
